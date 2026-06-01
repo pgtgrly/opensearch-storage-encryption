@@ -4,6 +4,7 @@
  */
 package org.opensearch.index.translog;
 
+import static org.opensearch.index.store.cipher.AesCipherFactory.computeChunkIVForAesGcm;
 import static org.opensearch.index.store.cipher.AesCipherFactory.computeOffsetIVForAesGcmEncrypted;
 
 import java.io.IOException;
@@ -230,12 +231,26 @@ public class TranslogChunkManager {
             // Use existing key management
             Key key = keyResolver.getDataKey();
 
-            long chunkOffset = (long) chunkIndex * GCM_CHUNK_SIZE;
-            byte[] chunkIV = computeOffsetIVForAesGcmEncrypted(baseIV, chunkOffset);
+            // Per-chunk GCM nonce: each chunk uses a distinct (key, nonce) pair.
+            byte[] chunkIV = computeChunkIVForAesGcm(baseIV, chunkIndex);
 
-            // Use existing GCM decryption with authentication
-            byte[] decrypted = AesGcmCipherFactory.decryptWithTag(key, chunkIV, encryptedWithTag);
-            return decrypted;
+            try {
+                return AesGcmCipherFactory.decryptWithTag(key, chunkIV, encryptedWithTag);
+            } catch (AesGcmCipherFactory.JavaCryptoException primary) {
+                // Backward compatibility: files written before the per-chunk nonce fix used the
+                // legacy IV (computeOffsetIVForAesGcmEncrypted), whose GCM nonce is the same for
+                // every chunk. If authentication fails with the new per-chunk nonce, retry once
+                // with the legacy nonce so existing translog generations remain recoverable. New
+                // writes always use the per-chunk nonce, so this fallback only triggers for
+                // pre-upgrade files. The legacy nonce differs from the new one for every chunk
+                // index (including 0), so all chunks of an old file go through this path.
+                //
+                // If the legacy decrypt also fails, the chunk is genuinely corrupt; its
+                // JavaCryptoException propagates to the outer handler below.
+                long legacyChunkOffset = (long) chunkIndex * GCM_CHUNK_SIZE;
+                byte[] legacyIV = computeOffsetIVForAesGcmEncrypted(baseIV, legacyChunkOffset);
+                return AesGcmCipherFactory.decryptWithTag(key, legacyIV, encryptedWithTag);
+            }
 
         } catch (NonReadableChannelException e) {
             // Channel is write-only
@@ -257,8 +272,8 @@ public class TranslogChunkManager {
             // Use existing key management
             Key key = keyResolver.getDataKey();
 
-            long chunkOffset = (long) chunkIndex * GCM_CHUNK_SIZE;
-            byte[] chunkIV = computeOffsetIVForAesGcmEncrypted(baseIV, chunkOffset);
+            // Per-chunk GCM nonce: each chunk uses a distinct (key, nonce) pair.
+            byte[] chunkIV = computeChunkIVForAesGcm(baseIV, chunkIndex);
 
             // Use existing GCM encryption (includes authentication tag)
             byte[] encryptedWithTag = AesGcmCipherFactory.encryptWithTag(key, chunkIV, plainData, plainData.length);
@@ -338,16 +353,18 @@ public class TranslogChunkManager {
 
         int totalWritten = 0;
 
-        // Initialize new cipher
+        // Initialize new cipher. The first block of the file is index 0 (no increment here);
+        // each subsequent block increments currentBlockNumber below. The block number is the
+        // chunk index, which feeds the per-block GCM nonce — so it must advance per block.
         if (currentCipher == null) {
-            initializeBlockCipher(currentBlockNumber++);
+            initializeBlockCipher(currentBlockNumber);
         }
 
         while (src.hasRemaining()) {
-            // Finalize cipher when block is full and initialize new cipher
+            // Finalize cipher when block is full and initialize new cipher for the next chunk index.
             if (currentCipher != null && currentBlockBytesWritten >= BLOCK_SIZE) {
                 finalizeCurrentBlock();
-                initializeBlockCipher(currentBlockNumber++);
+                initializeBlockCipher(++currentBlockNumber);
             }
 
             // Write what fits in current block
@@ -456,14 +473,21 @@ public class TranslogChunkManager {
     }
 
     /**
-     * Initialize GCM cipher for a new block
+     * Initialize GCM cipher for a new block.
+     *
+     * <p>The cipher is initialized with a per-block GCM nonce derived from {@code baseIV} and the
+     * block number (see {@link AesCipherFactory#computeChunkIVForAesGcm}). Each block within a
+     * translog file therefore uses a distinct (key, nonce) pair, as required for AES-GCM. The
+     * block number equals the chunk index, since one block maps to exactly one on-disk chunk.
      */
     private void initializeBlockCipher(long blockNumber) throws IOException {
         Key key = keyResolver.getDataKey();
-        long offset = blockNumber << BLOCK_SIZE_SHIFT;
+        byte[] blockIV = AesCipherFactory.computeChunkIVForAesGcm(baseIV, blockNumber);
 
         try {
-            this.currentCipher = OpenSslNativeCipher.initGCMCipher(key.getEncoded(), baseIV, offset);
+            // The GCM nonce is fully encoded in blockIV (bytes 0..11); initGCMCipher's third
+            // argument is unused for nonce derivation, so pass 0.
+            this.currentCipher = OpenSslNativeCipher.initGCMCipher(key.getEncoded(), blockIV, 0L);
         } catch (Throwable e) {
             throw new IOException("Failed to initialize cipher for blockNumber:" + blockNumber + " for file:" + filePath, e);
         }

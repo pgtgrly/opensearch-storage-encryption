@@ -111,6 +111,50 @@ public class AesCipherFactory {
     }
 
     /**
+     * Computes a per-chunk GCM IV for AES-GCM translog chunks.
+     *
+     * <p>Unlike {@link #computeOffsetIVForAesGcmEncrypted}, which adjusts the trailing four bytes
+     * (the CTR-mode counter block, ignored by GCM since GCM derives its 96-bit nonce from the
+     * <em>first</em> 12 bytes of the IV), this method varies the bytes that actually form the GCM
+     * nonce so that each chunk in a file gets a distinct IV. AES-GCM requires a distinct IV per
+     * message under a given key (NIST SP 800-38D); deriving the chunk IV in the trailing bytes left
+     * every chunk in a file with the same effective GCM IV.
+     *
+     * <p>The 96-bit nonce follows the deterministic construction in NIST SP 800-38D &sect;8.2.1:
+     * <ul>
+     *   <li>bytes 0&ndash;7: per-file fixed field, taken from {@code baseIV[0..7]} (derived per
+     *       translog UUID via HKDF, so it differs across files);</li>
+     *   <li>bytes 8&ndash;11: invocation field, a big-endian 32-bit chunk index (unique within a file).</li>
+     * </ul>
+     *
+     * <p>A 16-byte array is returned for layout compatibility with the GCM helpers (which read the
+     * leading 12 bytes only); bytes 12&ndash;15 are unused by GCM (they are where the CTR helper
+     * {@link #computeOffsetIVForAesGcmEncrypted} would place its counter, and are left as a copy of
+     * {@code baseIV} here). The 32-bit chunk index bounds a file to 2<sup>32</sup> chunks
+     * (~32&nbsp;PB at 8&nbsp;KB chunks), far above the translog roll size.
+     *
+     * @param baseIV the per-file base IV (at least 12 bytes; bytes 0&ndash;7 used as the fixed field)
+     * @param chunkIndex the zero-based chunk index within the file (0 &le; index &le; 2<sup>32</sup>-1)
+     * @return a 16-byte array whose first 12 bytes are the GCM nonce for this chunk
+     * @throws IllegalArgumentException if baseIV is null/too short or chunkIndex is out of range
+     */
+    public static byte[] computeChunkIVForAesGcm(byte[] baseIV, long chunkIndex) {
+        if (baseIV == null || baseIV.length < 12) {
+            throw new IllegalArgumentException("baseIV must be at least 12 bytes");
+        }
+        if (chunkIndex < 0 || chunkIndex > 0xFFFFFFFFL) {
+            throw new IllegalArgumentException("chunkIndex out of 32-bit range: " + chunkIndex);
+        }
+        byte[] iv = Arrays.copyOf(baseIV, IV_ARRAY_LENGTH);
+        // bytes 0..7 retain baseIV (per-file fixed field); bytes 8..11 = big-endian chunk index
+        iv[8] = (byte) (chunkIndex >>> 24);
+        iv[9] = (byte) (chunkIndex >>> 16);
+        iv[10] = (byte) (chunkIndex >>> 8);
+        iv[11] = (byte) chunkIndex;
+        return iv;
+    }
+
+    /**
      * Computes an offset-adjusted IV for pure CTR mode encryption/decryption at a specific file position.
      * This method generates IVs for data that was originally encrypted using standard CTR mode without
      * GCM compatibility adjustments.

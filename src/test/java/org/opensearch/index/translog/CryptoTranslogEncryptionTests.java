@@ -4,6 +4,7 @@
  */
 package org.opensearch.index.translog;
 
+import static org.junit.Assert.assertArrayEquals;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.when;
@@ -257,5 +258,81 @@ public class CryptoTranslogEncryptionTests extends OpenSearchTestCase {
         String rawContent = new String(rawFileContent, StandardCharsets.UTF_8);
 
         assertFalse("Data should be encrypted on disk", rawContent.contains("sensitive document data"));
+    }
+
+    /**
+     * Multi-chunk round trip: writes data spanning several 8&nbsp;KB GCM chunks so the per-chunk
+     * IV derivation is exercised for chunk index &gt; 0 on both the write and read paths. A
+     * regression in the per-chunk nonce (e.g. reusing one IV across chunks, or the streaming block
+     * counter failing to advance) would either corrupt the round trip or fail GCM authentication on
+     * read, so this directly guards the fix.
+     */
+    public void testMultiChunkRoundTrip() throws IOException {
+        String testTranslogUUID = "test-multichunk-uuid";
+        CryptoChannelFactory channelFactory = new CryptoChannelFactory(keyResolver, testTranslogUUID);
+        Path translogPath = tempDir.resolve("test-multichunk.tlog");
+
+        // ~5 chunks of distinct, position-dependent bytes (so a swapped/duplicated chunk is caught).
+        final int dataLen = 5 * TranslogChunkManager.GCM_CHUNK_SIZE + 1234;
+        byte[] testData = new byte[dataLen];
+        for (int i = 0; i < dataLen; i++) {
+            testData[i] = (byte) ((i * 31 + 7) & 0xFF);
+        }
+
+        int headerSize;
+        try (FileChannel writeChannel = channelFactory.open(translogPath, StandardOpenOption.CREATE, StandardOpenOption.WRITE)) {
+            TranslogHeader header = new TranslogHeader(testTranslogUUID, 1L);
+            header.write(writeChannel, false);
+            headerSize = header.sizeInBytes();
+
+            // Write in several calls of varying size to cross chunk boundaries mid-call.
+            long pos = headerSize;
+            int[] sliceSizes = { 100, TranslogChunkManager.GCM_CHUNK_SIZE, 3000, 9000, dataLen };
+            int written = 0;
+            for (int slice : sliceSizes) {
+                if (written >= dataLen) {
+                    break;
+                }
+                int n = Math.min(slice, dataLen - written);
+                ByteBuffer chunk = ByteBuffer.wrap(testData, written, n);
+                int w = writeChannel.write(chunk, pos);
+                assertEquals("partial write not expected in test", n, w);
+                pos += w;
+                written += w;
+            }
+            assertEquals("should have written all data", dataLen, written);
+        }
+
+        // Read the whole payload back and verify it is byte-identical (decryption + per-chunk IV).
+        try (FileChannel readChannel = channelFactory.open(translogPath, StandardOpenOption.READ)) {
+            byte[] readBack = new byte[dataLen];
+            int total = 0;
+            while (total < dataLen) {
+                ByteBuffer rb = ByteBuffer.wrap(readBack, total, dataLen - total);
+                int n = readChannel.read(rb, headerSize + total);
+                assertTrue("unexpected EOF at offset " + total, n > 0);
+                total += n;
+            }
+            assertEquals("should read all data back", dataLen, total);
+            assertArrayEquals("multi-chunk round trip must be byte-identical", testData, readBack);
+        }
+
+        // And confirm it is genuinely encrypted on disk (a recognizable plaintext run is absent).
+        byte[] rawFileContent = Files.readAllBytes(translogPath);
+        // The first 16 plaintext bytes as they would appear contiguously; must not be present verbatim.
+        byte[] needle = java.util.Arrays.copyOfRange(testData, 0, 16);
+        assertFalse("plaintext run should not appear on disk", indexOf(rawFileContent, needle) >= 0);
+    }
+
+    private static int indexOf(byte[] haystack, byte[] needle) {
+        outer: for (int i = 0; i + needle.length <= haystack.length; i++) {
+            for (int j = 0; j < needle.length; j++) {
+                if (haystack[i + j] != needle[j]) {
+                    continue outer;
+                }
+            }
+            return i;
+        }
+        return -1;
     }
 }
